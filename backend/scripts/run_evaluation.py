@@ -55,6 +55,22 @@ async def run_evaluation():
      into the LLM context, which increases hallucination risks and prompt costs.
 """)
 
+    print("=" * 80)
+    print("Evaluation Harness Methodology & Mock-Provider Limitations:")
+    print("=" * 80)
+    print("""
+- Synthetic Lexical Hashing: The offline benchmark uses deterministic term-frequency hashing
+  (MockEmbeddingProvider) to achieve reproducible, zero-cost CI test execution without external
+  cloud dependencies.
+- Vocabulary vs. Semantic Paraphrase: The mock provider measures lexical term overlap. It does
+  NOT model complex semantic synonymy, cross-lingual reasoning, or contextual nuances that
+  pretrained neural embedding models (e.g., text-embedding-3-small) capture.
+- Production Configuration: For production evaluation with neural embeddings and hosted LLM models,
+  set EMBEDDING_PROVIDER=openai (or gemini) and LLM_PROVIDER=openai (or gemini) in backend/.env.
+- Latency Semantics: Latencies recorded below (16ms-56ms) reflect local in-memory CPU hashing and
+  do not include external cloud network roundtrip overhead.
+""")
+
 
 def main():
     asyncio.run(run_evaluation())

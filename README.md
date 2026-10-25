@@ -34,6 +34,48 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) assistant for company H
                                                  +---------------+
 ```
 
+### Component Flow
+
+```mermaid
+flowchart TD
+    subgraph Frontend["React (Vite) Frontend"]
+        UI["B2B SaaS Interface"]
+        AuthContext["AuthContext (JWT Bearer)"]
+        AdminView["Admin Dashboard (Upload & Jobs)"]
+        ChatView["Employee Chat Interface"]
+    end
+
+    subgraph Backend["FastAPI Backend (REST API)"]
+        AuthAPI["/api/v1/auth"]
+        DocsAPI["/api/v1/documents"]
+        JobsAPI["/api/v1/jobs"]
+        ChatAPI["/api/v1/chat"]
+        RetrievalService["Retrieval Service (Cosine Search)"]
+        AnsweringService["Grounded Answering & Citation Validation"]
+    end
+
+    subgraph Storage["Storage & Asynchronous Processing"]
+        PG[("PostgreSQL 16 + pgvector")]
+        RedisQueue[("Redis 7 Ingestion Queue")]
+        Worker["Background Ingestion Worker"]
+    end
+
+    UI --> AuthContext
+    AuthContext --> AuthAPI
+    AdminView --> DocsAPI
+    AdminView --> JobsAPI
+    ChatView --> ChatAPI
+
+    DocsAPI -->|1. Enqueue Job| RedisQueue
+    RedisQueue -->|2. Dequeue Task| Worker
+    Worker -->|3. Extract & Embed Chunks| PG
+
+    ChatAPI --> RetrievalService
+    RetrievalService -->|Vector Search| PG
+    RetrievalService --> AnsweringService
+    AnsweringService -->|Verified Grounded Answer| ChatView
+```
+
 ---
 
 ## Technology Stack
@@ -53,7 +95,7 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) assistant for company H
 - **RAG Services**: Custom PDF/DOCX/TXT text extraction, token-aware chunking, cosine vector similarity retrieval, prompt-sandboxed grounded question answering, citation verification
 - **Providers**: Pluggable `EmbeddingProvider` and `LLMProvider` abstractions (Mock, OpenAI, and Gemini)
 - **Testing**: `pytest`, `pytest-asyncio`, in-memory test fixtures, live pgvector container integration tests
-- **Operations**: Docker, Docker Compose, structured JSON logging
+- **Operations**: Docker, Docker Compose, structured JSON logging, GitHub Actions CI
 
 ---
 
@@ -61,6 +103,9 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) assistant for company H
 
 ```
 .
+├── .github/
+│   └── workflows/
+│       └── ci.yml            # GitHub Actions CI workflow (services: pgvector, redis)
 ├── backend/
 │   ├── alembic/              # Database migration scripts
 │   ├── app/
@@ -80,7 +125,7 @@ An enterprise-grade Retrieval-Augmented Generation (RAG) assistant for company H
 │   │   └── worker.py         # Redis background worker entrypoint
 │   ├── scripts/
 │   │   └── run_evaluation.py # Standalone RAG evaluation benchmark CLI runner
-│   ├── tests/                # 68 unit/integration tests (retrieval, answering, chat API, evaluation)
+│   ├── tests/                # 69 unit/integration tests (retrieval, answering, chat API, logging, evaluation)
 │   ├── Dockerfile            # Container build for API and Worker
 │   ├── requirements.txt      # Pinned Python dependencies
 │   ├── .env.example          # Sample environment configuration
@@ -232,6 +277,12 @@ The repository includes an offline evaluation harness (`backend/scripts/run_eval
 
 **Selection Rationale**: The **Balanced (~500 tokens / 2000 chars)** configuration is configured as default because it achieves optimal factual coverage (91.3%) and 100% retrieval hit-rate while capturing full policy clauses and approval procedures in single chunks.
 
+### Evaluation Methodology & Mock-Provider Limitations
+- **Synthetic Lexical Hashing**: The offline benchmark uses deterministic term-frequency hashing (`MockEmbeddingProvider`) to enable fast, zero-cost CI test execution without external cloud dependencies.
+- **Vocabulary vs. Semantic Reasoning**: The mock provider measures lexical term overlap. It does not capture complex semantic synonymy, cross-sentence inference, or polysemy that pretrained neural embedding models (e.g. `text-embedding-3-small` or `text-embedding-004`) provide.
+- **Production Benchmarking**: To evaluate against real semantic vectors, set `EMBEDDING_PROVIDER=openai` (or `gemini`) and `LLM_PROVIDER=openai` (or `gemini`) in `backend/.env`.
+- **Latency Semantics**: The reported latencies (18ms–60ms) reflect local CPU hashing rather than external cloud API network roundtrips.
+
 Run the evaluation benchmark:
 ```bash
 python backend/scripts/run_evaluation.py
@@ -328,12 +379,19 @@ cd frontend && npm run build
 ```bash
 backend/.venv/bin/pytest -v
 ```
-- **Result**: **67 passed, 1 skipped** in 10.08s.
+- **Result**: **68 passed, 1 skipped** in 10.15s.
 - `test_pgvector_native_cosine_distance_query` skipped as intended when `TEST_POSTGRES_URL` is unset (requires a running live pgvector container).
-- All auth, upload, chunking, retrieval, grounded answering, citation verification, and CLI tests passed.
+- All auth, upload, chunking, retrieval, grounded answering, citation verification, CLI, and structured JSON logging redaction tests passed.
 
 ### 3. Docker Compose Validation
 ```bash
 docker compose config
 ```
 - **Result**: Successfully validated service graph (`db`, `redis`, `api`, `worker`) with health checks, persistent volumes, and port forwardings.
+
+### 4. Continuous Integration (GitHub Actions)
+- **Workflow**: `.github/workflows/ci.yml`
+- **Jobs**:
+  1. `backend-test`: Spins up service containers for `pgvector/pgvector:pg16` and `redis:7-alpine`, executes Alembic migrations, runs complete pytest suite (including live pgvector integration tests), and runs the RAG evaluation benchmark.
+  2. `frontend-build`: Installs node dependencies via `npm ci` and compiles the production Vite bundle.
+  3. `docker-compose-validation`: Validates Compose service graphs.

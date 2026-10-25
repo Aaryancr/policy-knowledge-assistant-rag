@@ -8,7 +8,33 @@ from typing import Any
 
 
 class JSONFormatter(logging.Formatter):
-    """Formats log records as single-line JSON objects for structured observability."""
+    """Formats log records as single-line JSON objects with automatic secret redaction."""
+
+    SENSITIVE_KEYS = {
+        "password",
+        "secret",
+        "token",
+        "access_token",
+        "authorization",
+        "api_key",
+        "apikey",
+        "credentials",
+        "bearer",
+        "hashed_password",
+    }
+
+    def _sanitize_value(self, key: str, value: Any) -> Any:
+        key_lower = key.lower()
+        if any(sens in key_lower for sens in self.SENSITIVE_KEYS):
+            return "[REDACTED]"
+        if isinstance(value, dict):
+            return {k: self._sanitize_value(k, v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._sanitize_value(key, item) for item in value]
+        # Prevent huge document payloads from flooding logs
+        if isinstance(value, str) and len(value) > 1000:
+            return value[:997] + "..."
+        return value
 
     def format(self, record: logging.LogRecord) -> str:
         log_obj: dict[str, Any] = {
@@ -23,14 +49,18 @@ class JSONFormatter(logging.Formatter):
         if record.exc_info:
             log_obj["exception"] = self.formatException(record.exc_info)
 
-        # Include any custom extra attributes passed to the logger
+        # Include sanitized custom extra attributes passed to the logger
         standard_attrs = {
             "name", "msg", "args", "levelname", "levelno", "pathname", "filename",
             "module", "exc_info", "exc_text", "stack_info", "lineno", "funcName",
             "created", "msecs", "relativeCreated", "thread", "threadName",
             "processName", "process", "message",
         }
-        extras = {k: v for k, v in record.__dict__.items() if k not in standard_attrs}
+        extras = {
+            k: self._sanitize_value(k, v)
+            for k, v in record.__dict__.items()
+            if k not in standard_attrs
+        }
         if extras:
             log_obj["extra"] = extras
 
