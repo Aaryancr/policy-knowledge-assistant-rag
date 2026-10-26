@@ -108,6 +108,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Prepare environment file from example
+        run: |
+          cp backend/.env.example backend/.env
+
       - name: Validate Docker Compose config
         run: |
           docker compose config

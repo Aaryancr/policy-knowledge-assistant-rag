@@ -58,7 +58,9 @@ async def test_pgvector_native_cosine_distance_query(pg_session: AsyncSession):
         id=uuid.uuid4(),
         email="pg_admin@example.com",
         hashed_password="mockpassword",
+        full_name="Postgres Admin",
         role="admin",
+        is_active=True,
     )
     pg_session.add(user)
     await pg_session.flush()
