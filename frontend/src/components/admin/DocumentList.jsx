@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { StatusBadge } from '../common/Badge';
 import { Button } from '../common/Button';
-import { FileTextIcon, TrashIcon, LayersIcon, AlertCircleIcon } from '../common/Icons';
+import { FileTextIcon, TrashIcon, LayersIcon, AlertCircleIcon, RefreshCwIcon } from '../common/Icons';
 import { Modal } from '../common/Modal';
 
 function formatFileSize(bytes) {
@@ -31,6 +31,8 @@ function formatDate(dateStr) {
 export function DocumentList({
   documents = [],
   isLoading = false,
+  error = null,
+  onRetry = null,
   onDeleteDocument,
   onSelectChunks,
 }) {
@@ -54,7 +56,9 @@ export function DocumentList({
         <div>
           <h2 className="card-title">Policy Documents</h2>
           <p className="card-subtitle">
-            {documents.length} {documents.length === 1 ? 'document' : 'documents'} registered in the knowledge base.
+            {error && documents.length === 0
+              ? 'Unable to retrieve knowledge base records.'
+              : `${documents.length} ${documents.length === 1 ? 'document' : 'documents'} registered in the knowledge base.`}
           </p>
         </div>
       </div>
@@ -64,6 +68,23 @@ export function DocumentList({
           <div className="skeleton-row" />
           <div className="skeleton-row" />
           <div className="skeleton-row" />
+        </div>
+      ) : error && documents.length === 0 ? (
+        <div className="empty-table-state error-table-state">
+          <AlertCircleIcon size={40} className="text-danger" />
+          <p className="empty-title">Failed to load policy documents</p>
+          <p className="empty-desc">{error}</p>
+          {onRetry && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={onRetry}
+              style={{ marginTop: '0.75rem' }}
+              icon={<RefreshCwIcon size={14} />}
+            >
+              Retry
+            </Button>
+          )}
         </div>
       ) : documents.length === 0 ? (
         <div className="empty-table-state">

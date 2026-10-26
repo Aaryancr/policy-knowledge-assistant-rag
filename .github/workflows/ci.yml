@@ -95,6 +95,11 @@ jobs:
           cd frontend
           npm ci
 
+      - name: Run frontend unit tests
+        run: |
+          cd frontend
+          npm test
+
       - name: Build frontend for production
         run: |
           cd frontend

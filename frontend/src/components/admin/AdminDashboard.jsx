@@ -1,5 +1,10 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { listDocuments, deleteDocument } from '../../api/documents';
+import {
+  listDocuments,
+  deleteDocument,
+  parseDocumentListResponse,
+  calculateDocumentStats,
+} from '../../api/documents';
 import { DocumentUpload } from './DocumentUpload';
 import { DocumentList } from './DocumentList';
 import { ChunksModal } from './ChunksModal';
@@ -8,26 +13,35 @@ import { Button } from '../common/Button';
 
 export function AdminDashboard() {
   const [documents, setDocuments] = useState([]);
+  const [serverTotal, setServerTotal] = useState(null);
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [selectedDocForChunks, setSelectedDocForChunks] = useState(null);
   const [errorMsg, setErrorMsg] = useState('');
   const pollTimerRef = useRef(null);
+  const isFetchingRef = useRef(false);
 
   const fetchDocuments = useCallback(async (showRefreshing = false) => {
+    if (isFetchingRef.current) {
+      return;
+    }
+    isFetchingRef.current = true;
     if (showRefreshing) {
       setIsRefreshing(true);
     }
     setErrorMsg('');
     try {
       const response = await listDocuments({ limit: 100 });
-      const docs = response?.documents || [];
-      setDocuments(docs);
-      return docs;
+      const { items, total } = parseDocumentListResponse(response);
+      setDocuments(items);
+      setServerTotal(total);
+      return items;
     } catch (err) {
-      setErrorMsg(err.message || 'Failed to fetch policy documents.');
-      return [];
+      const message = err.message || 'Failed to fetch policy documents.';
+      setErrorMsg(message);
+      return null;
     } finally {
+      isFetchingRef.current = false;
       setIsLoading(false);
       setIsRefreshing(false);
     }
@@ -41,7 +55,7 @@ export function AdminDashboard() {
   // Polling for active background jobs
   useEffect(() => {
     const hasActiveJobs = documents.some(
-      (d) => d.status === 'processing' || d.status === 'queued'
+      (d) => d.status === 'processing' || d.status === 'queued' || d.status === 'pending'
     );
 
     if (hasActiveJobs) {
@@ -66,6 +80,7 @@ export function AdminDashboard() {
   const handleDelete = async (docId) => {
     await deleteDocument(docId);
     setDocuments((prev) => prev.filter((d) => d.id !== docId));
+    setServerTotal((prev) => (prev !== null && prev > 0 ? prev - 1 : 0));
   };
 
   const handleUploadSuccess = () => {
@@ -73,10 +88,11 @@ export function AdminDashboard() {
   };
 
   // Derive metrics strictly from actual API data
-  const totalCount = documents.length;
-  const completedCount = documents.filter((d) => d.status === 'completed').length;
-  const processingCount = documents.filter((d) => d.status === 'processing' || d.status === 'queued').length;
-  const failedCount = documents.filter((d) => d.status === 'failed').length;
+  const stats = calculateDocumentStats(documents, serverTotal);
+  const totalCount = stats.total;
+  const completedCount = stats.completed;
+  const processingCount = stats.processing;
+  const failedCount = stats.failed;
 
   return (
     <div className="admin-dashboard-container">
@@ -158,6 +174,8 @@ export function AdminDashboard() {
       <DocumentList
         documents={documents}
         isLoading={isLoading}
+        error={errorMsg}
+        onRetry={() => fetchDocuments(true)}
         onDeleteDocument={handleDelete}
         onSelectChunks={(doc) => setSelectedDocForChunks(doc)}
       />
