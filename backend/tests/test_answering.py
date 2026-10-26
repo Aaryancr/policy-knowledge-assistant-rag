@@ -11,6 +11,8 @@ from app.services.answering import (
     build_evidence_prompt,
     generate_grounded_answer,
     parse_and_validate_citations,
+    verify_claim_grounding,
+    create_grounded_snippet,
 )
 from app.services.retrieval import RetrievedChunk
 
@@ -173,3 +175,139 @@ async def test_successful_grounded_answer_with_real_citations():
     assert result.citations[0].section_title == "Password Rotation"
     assert result.confidence_score == chunk.similarity_score
     assert result.latency_ms >= 0
+
+
+async def test_annual_leave_question_returns_source_supported_figure_and_grounded_snippet():
+    """Regression test: Annual leave question against Northstar sample policy extracts 15 working days (not 20 PTO)
+    and verifies the citation snippet displays the exact annual leave clause rather than scope boilerplate.
+    """
+    northstar_chunk_1 = _make_retrieved_chunk(
+        doc_title="Northstar demo employee leave policy",
+        doc_filename="northstar_demo_employee_leave_policy.pdf",
+        content=(
+            "NORTHSTAR ENTERPRISES EMPLOYEE LEAVE POLICY 1. PURPOSE AND SCOPE Northstar Enterprises is "
+            "committed to supporting employee well-being, work-life balance, and adequate rest through "
+            "clear and structured leave entitlements. This policy governs all full-time and regular "
+            "part-time personnel operating across corporate offices and authorized remote locations. "
+            "2. ANNUAL LEAVE Eligible full-time employees receive 15 working days of annual leave per "
+            "calendar year. Annual leave is intended for vacations, personal matters, and rest. Employees "
+            "should submit annual leave requests at least 3"
+        ),
+        page=1,
+        section="1. PURPOSE AND SCOPE",
+        similarity=0.5535,
+    )
+
+    mock_llm = MockLLMProvider()
+    result = await generate_grounded_answer(
+        question="How many annual leave days do full-time employees receive per year?",
+        retrieved_chunks=[northstar_chunk_1],
+        llm_provider=mock_llm,
+    )
+
+    # 1. Must NOT abstain
+    assert result.is_unanswerable is False
+    assert result.answer != ABSTENTION_MESSAGE
+
+    # 2. Must contain the source-supported figure (15 working days), NOT 20 days PTO
+    assert "15 working days" in result.answer
+    assert "20 days" not in result.answer
+    assert "paid time off" not in result.answer.lower()
+
+    # 3. Citation must point to Chunk 1
+    assert len(result.citations) == 1
+    citation = result.citations[0]
+    assert citation.chunk_id == northstar_chunk_1.chunk_id
+
+    # 4. Snippet must be grounded on the annual leave clause, not merely purpose and scope boilerplate
+    assert "15 working days" in citation.snippet
+    assert "ANNUAL LEAVE" in citation.snippet
+
+
+async def test_rejection_of_unsupported_claim_even_with_valid_chunk_id():
+    """Regression test: Even when citing a valid chunk ID, an answer asserting unsupported numbers (e.g. 20 days
+    when source says 15 days) must fail citation validation and cause the system to abstain.
+    """
+    chunk = _make_retrieved_chunk(
+        content="Eligible full-time employees receive 15 working days of annual leave per calendar year.",
+        page=1,
+        section="Annual Leave",
+    )
+
+    # LLM hallucinates 20 days PTO citing the valid chunk ID
+    hallucinated_answer = (
+        f"Full-time employees accrue 20 days of paid time off per year, and up to 5 unused days "
+        f"may be carried over before March 31. [Chunk {chunk.chunk_id}]"
+    )
+
+    # Citation validation must reject the citation because '20' is not in the source chunk
+    _, citations = parse_and_validate_citations(hallucinated_answer, [chunk])
+    assert len(citations) == 0
+
+    class HallucinatingLLM(LLMProvider):
+        async def generate(self, prompt: str, **kwargs: Any) -> str:
+            return hallucinated_answer
+
+    result = await generate_grounded_answer(
+        question="How many annual leave days do full-time employees receive per year?",
+        retrieved_chunks=[chunk],
+        llm_provider=HallucinatingLLM(),
+    )
+
+    # System must safely abstain instead of delivering the ungrounded claim
+    assert result.answer == ABSTENTION_MESSAGE
+    assert result.is_unanswerable is True
+    assert len(result.citations) == 0
+
+
+async def test_rejection_of_hallucinated_topic_with_valid_chunk_id():
+    """Regression test: Unsupported topic assertions citing a valid chunk ID are rejected and trigger abstention."""
+    chunk = _make_retrieved_chunk(
+        content="Eligible full-time employees receive 15 working days of annual leave per calendar year.",
+    )
+
+    class OffTopicHallucinatingLLM(LLMProvider):
+        async def generate(self, prompt: str, **kwargs: Any) -> str:
+            return f"Employees receive unlimited gourmet snacks and catered lunch. [Chunk {chunk.chunk_id}]"
+
+    result = await generate_grounded_answer(
+        question="What snacks are provided?",
+        retrieved_chunks=[chunk],
+        llm_provider=OffTopicHallucinatingLLM(),
+    )
+
+    assert result.answer == ABSTENTION_MESSAGE
+    assert result.is_unanswerable is True
+    assert len(result.citations) == 0
+
+
+def test_verify_claim_grounding_numerical_and_lexical_checks():
+    """Unit tests for verify_claim_grounding verifying number and content word grounding rules."""
+    source_content = (
+        "Eligible full-time employees receive 15 working days of annual leave per calendar year. "
+        "Carried-over leave must not exceed 5 days."
+    )
+
+    # Grounded claim with correct numbers and terms
+    assert verify_claim_grounding(
+        "Full-time employees receive 15 working days of annual leave.",
+        source_content,
+    ) is True
+
+    # Ungrounded claim with conflicting number (20 days instead of 15)
+    assert verify_claim_grounding(
+        "Full-time employees receive 20 working days of annual leave.",
+        source_content,
+    ) is False
+
+    # Ungrounded claim with fabricated number
+    assert verify_claim_grounding(
+        "Employees get 30 days leave.",
+        source_content,
+    ) is False
+
+    # Ungrounded claim with fabricated topic
+    assert verify_claim_grounding(
+        "Employees receive free gym memberships and wellness vouchers.",
+        source_content,
+    ) is False

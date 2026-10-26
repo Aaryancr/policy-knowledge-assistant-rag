@@ -11,6 +11,8 @@ from app.services.answering import (
     build_evidence_prompt,
     parse_and_validate_citations,
     generate_grounded_answer,
+    verify_claim_grounding,
+    create_grounded_snippet,
 )
 
 __all__ = [
@@ -29,4 +31,6 @@ __all__ = [
     "build_evidence_prompt",
     "parse_and_validate_citations",
     "generate_grounded_answer",
+    "verify_claim_grounding",
+    "create_grounded_snippet",
 ]

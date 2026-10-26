@@ -66,16 +66,114 @@ def build_evidence_prompt(question: str, chunks: list[RetrievedChunk]) -> str:
     return user_prompt
 
 
+STOPWORDS = {
+    "a", "an", "the", "in", "on", "at", "by", "for", "with", "about", "against",
+    "between", "into", "through", "during", "before", "after", "above", "below",
+    "to", "from", "up", "down", "out", "off", "over", "under", "again",
+    "further", "then", "once", "here", "there", "when", "where", "why", "how", "all",
+    "any", "both", "each", "few", "more", "most", "other", "some", "such", "no",
+    "nor", "not", "only", "own", "same", "so", "than", "too", "very", "can", "will",
+    "just", "don", "should", "now", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "having", "do", "does", "did", "doing", "would", "could",
+    "what", "which", "who", "whom", "this", "that", "these", "those", "am", "per", "and",
+    "also", "must", "may",
+}
+
+
+def _stem(word: str) -> str:
+    """Simple stemmer for basic suffix reduction in policy text comparison."""
+    w = word.lower()
+    for suffix in ("ing", "ies", "es", "ed", "s"):
+        if w.endswith(suffix) and len(w) > len(suffix) + 2:
+            return w[:-len(suffix)]
+    return w
+
+
+def verify_claim_grounding(claim_text: str, chunk_content: str) -> bool:
+    """Verifies that factual assertions (numbers, quantities, and keywords) are grounded in chunk content.
+
+    Returns False if numbers in the claim do not exist in the source chunk or if content overlap is insufficient.
+    """
+    # 1. Numerical verification: all numbers/quantities asserted in the claim must exist in the chunk
+    claim_nums = set(re.findall(r"\b\d+(?:\.\d+)?\b", claim_text))
+    chunk_nums = set(re.findall(r"\b\d+(?:\.\d+)?\b", chunk_content))
+    if claim_nums and not claim_nums.issubset(chunk_nums):
+        return False
+
+    # 2. Content word overlap verification: content keywords must have sufficient presence in chunk
+    claim_words = [
+        w for w in re.findall(r"\b[a-zA-Z0-9]+\b", claim_text.lower())
+        if w not in STOPWORDS and len(w) >= 3 and not w.isdigit()
+    ]
+    if not claim_words:
+        return True
+
+    chunk_tokens = set(re.findall(r"\b[a-zA-Z0-9]+\b", chunk_content.lower()))
+    chunk_stems = {_stem(t) for t in chunk_tokens} | chunk_tokens
+    matched = sum(1 for w in claim_words if w in chunk_tokens or _stem(w) in chunk_stems)
+    return (matched / len(claim_words)) >= 0.40
+
+
+def create_grounded_snippet(claim_text: str, chunk_content: str, max_len: int = 160) -> str:
+    """Extracts an evidence window from chunk content centered around the sentence supporting the claim."""
+    clean_chunk = chunk_content.strip().replace("\n", " ")
+    if len(clean_chunk) <= max_len:
+        return clean_chunk
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", clean_chunk) if s.strip()]
+    claim_words = [
+        w for w in re.findall(r"\b[a-zA-Z0-9]+\b", claim_text.lower())
+        if w not in STOPWORDS and len(w) >= 3
+    ]
+    claim_stems = {_stem(w) for w in claim_words}
+
+    best_sent = ""
+    best_overlap = -1
+    best_idx = 0
+
+    for sent in sentences:
+        sent_tokens = set(re.findall(r"\b[a-zA-Z0-9]+\b", sent.lower()))
+        sent_stems = {_stem(t) for t in sent_tokens} | sent_tokens
+        overlap = len(claim_stems.intersection(sent_stems))
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_sent = sent
+            best_idx = clean_chunk.find(sent)
+
+    if best_overlap <= 0:
+        return clean_chunk[: max_len - 3].strip() + "..."
+
+    sent_len = len(best_sent)
+    if sent_len >= max_len:
+        start_pos = best_idx
+        end_pos = best_idx + max_len
+    else:
+        margin = (max_len - sent_len) // 2
+        start_pos = max(0, best_idx - margin)
+        end_pos = min(len(clean_chunk), start_pos + max_len)
+        if end_pos - start_pos < max_len:
+            start_pos = max(0, end_pos - max_len)
+
+    snippet = clean_chunk[start_pos:end_pos].strip()
+    if start_pos > 0 and not snippet.startswith("..."):
+        snippet = "..." + snippet
+    if end_pos < len(clean_chunk) and not snippet.endswith("..."):
+        snippet = snippet + "..."
+    return snippet
+
+
 def parse_and_validate_citations(
     raw_answer: str,
     retrieved_chunks: list[RetrievedChunk],
 ) -> tuple[str, list[Citation]]:
     """Extracts chunk IDs from LLM output, validates against retrieved set, and resolves DB metadata.
     
-    Rejects any fabricated or unretrieved chunk IDs.
+    Verifies that the cited chunk factually supports the claim. Rejects fabricated citations
+    or citations that fail grounding checks. If any citation fails validation, returns an empty
+    citation list so the answering service safely abstains.
     """
     valid_chunk_map: dict[str, RetrievedChunk] = {
-        str(c.chunk_id): c for c in retrieved_chunks
+        str(c.chunk_id).lower(): c for c in retrieved_chunks
     }
 
     # Matches [Chunk <uuid>], [chunk: <uuid>], or [<uuid>]
@@ -84,20 +182,35 @@ def parse_and_validate_citations(
         re.IGNORECASE,
     )
 
-    found_ids = uuid_pattern.findall(raw_answer)
+    matches = list(uuid_pattern.finditer(raw_answer))
+    if not matches:
+        return raw_answer, []
+
     citations: list[Citation] = []
     seen_chunk_ids: set[str] = set()
+    last_end = 0
 
-    for cid_str in found_ids:
-        normalized_id = cid_str.lower()
-        if normalized_id in valid_chunk_map and normalized_id not in seen_chunk_ids:
-            seen_chunk_ids.add(normalized_id)
-            c = valid_chunk_map[normalized_id]
-            # Create a clean snippet from actual verified content
-            clean_snippet = c.content.strip().replace("\n", " ")
-            if len(clean_snippet) > 160:
-                clean_snippet = clean_snippet[:157] + "..."
+    for m in matches:
+        cid_str = m.group(1).lower()
+        claim_segment = raw_answer[last_end : m.start()].strip()
+        last_end = m.end()
 
+        # Split preceding text to isolate the immediate asserted sentence/clause
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", claim_segment) if s.strip()]
+        claim_text = sentences[-1] if sentences else claim_segment
+
+        if cid_str not in valid_chunk_map:
+            # Fabricated or unretrieved chunk ID -> invalid
+            return raw_answer, []
+
+        c = valid_chunk_map[cid_str]
+        if not verify_claim_grounding(claim_text, c.content):
+            # Claim not grounded by cited chunk -> reject citation
+            return raw_answer, []
+
+        if cid_str not in seen_chunk_ids:
+            seen_chunk_ids.add(cid_str)
+            clean_snippet = create_grounded_snippet(claim_text, c.content, max_len=160)
             citations.append(
                 Citation(
                     chunk_id=c.chunk_id,

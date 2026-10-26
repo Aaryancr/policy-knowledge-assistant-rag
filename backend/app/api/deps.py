@@ -38,8 +38,8 @@ async def get_current_user(
                 detail="Token payload is missing subject claim",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        user_id = uuid.UUID(user_id_str)
-    except (jwt.PyJWTError, ValueError):
+        user_id = uuid.UUID(str(user_id_str))
+    except (jwt.PyJWTError, ValueError, AttributeError):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired token",

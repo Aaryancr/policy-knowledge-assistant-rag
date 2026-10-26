@@ -85,7 +85,33 @@ class MockEmbeddingProvider(EmbeddingProvider):
 
 
 class MockLLMProvider(LLMProvider):
-    """Deterministic mock LLM provider for tests, validation, and offline execution."""
+    """Deterministic mock LLM provider for tests, validation, and offline execution.
+
+    Synthesizes answers strictly from the provided evidence context blocks in the prompt,
+    matching question keywords against source sentences, and citing the exact supporting chunk.
+    Abstains if evidence is insufficient or question keywords are unanswerable.
+    """
+
+    STOPWORDS = {
+        "a", "an", "the", "in", "on", "at", "by", "for", "with", "about", "against",
+        "between", "into", "through", "during", "before", "after", "above", "below",
+        "to", "from", "up", "down", "out", "off", "over", "under", "again",
+        "further", "then", "once", "here", "there", "when", "where", "why", "how", "all",
+        "any", "both", "each", "few", "more", "most", "other", "some", "such", "no",
+        "nor", "not", "only", "own", "same", "so", "than", "too", "very", "can", "will",
+        "just", "don", "should", "now", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "having", "do", "does", "did", "doing", "would", "could",
+        "what", "which", "who", "whom", "this", "that", "these", "those", "am", "per", "and",
+        "also", "must", "may",
+    }
+
+    @staticmethod
+    def _stem(word: str) -> str:
+        w = word.lower()
+        for suffix in ("ing", "ies", "es", "ed", "s"):
+            if w.endswith(suffix) and len(w) > len(suffix) + 2:
+                return w[:-len(suffix)]
+        return w
 
     async def generate(
         self,
@@ -104,32 +130,63 @@ class MockLLMProvider(LLMProvider):
         if any(kw in prompt_lower for kw in unanswerable_keywords):
             return "I don't know based on the provided documents."
 
-        # Extract available chunk IDs from prompt: [Chunk <uuid>]
-        chunk_matches = re.findall(
-            r"\[Chunk\s+([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\]",
-            prompt,
-            re.IGNORECASE,
-        )
-
-        if not chunk_matches:
-            return "I don't know based on the provided documents."
-
-        primary_chunk_id = chunk_matches[0]
-
         # Extract question if present
         q_match = re.search(r"Employee Question:\s*(.*?)(?:\n|$)", prompt)
-        q_text = q_match.group(1).lower() if q_match else ""
+        q_text = q_match.group(1).strip() if q_match else ""
+        if not q_text:
+            return "I don't know based on the provided documents."
 
-        if "password" in q_text:
-            return f"Corporate account passwords must be at least 14 characters long and changed every 90 days. [Chunk {primary_chunk_id}]"
-        elif "pto" in q_text or "time off" in q_text or "leave" in q_text:
-            return f"Full-time employees accrue 20 days of paid time off per year, and up to 5 unused days may be carried over before March 31. [Chunk {primary_chunk_id}]"
-        elif "stipend" in q_text or "remote" in q_text or "equipment" in q_text:
-            return f"Eligible remote employees receive a one-time home office equipment stipend of $500. [Chunk {primary_chunk_id}]"
-        elif "per diem" in q_text or "travel" in q_text:
-            return f"The daily meal per diem is $75 for domestic travel and $100 for international travel. [Chunk {primary_chunk_id}]"
+        # Extract chunk blocks: [Chunk <uuid>] ... content ... up to next chunk or fence
+        chunk_pattern = re.compile(
+            r"\[Chunk\s+([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\][^\n]*\n(.*?)(?=(?:\n---|\n--- EVIDENCE EXCERPTS END ---|$))",
+            re.DOTALL | re.IGNORECASE,
+        )
+        blocks = list(chunk_pattern.finditer(prompt))
+        if not blocks:
+            return "I don't know based on the provided documents."
 
-        return f"Based on the provided policy documents, employees must comply with the stated corporate guidelines. [Chunk {primary_chunk_id}]"
+        q_tokens = [
+            w for w in re.findall(r"\b[a-zA-Z0-9]+\b", q_text.lower())
+            if w not in self.STOPWORDS and len(w) >= 2
+        ]
+        if not q_tokens:
+            return "I don't know based on the provided documents."
+        q_stems = {self._stem(w) for w in q_tokens}
+
+        best_sent = ""
+        best_chunk_id = ""
+        best_score = 0.0
+
+        for match in blocks:
+            cid = match.group(1)
+            raw_content = match.group(2).strip()
+            # Split into candidate sentences
+            sentences = [
+                s.strip() for s in re.split(r"(?<=[.!?])\s+|\n+", raw_content)
+                if len(s.strip()) > 15
+            ]
+            for s in sentences:
+                s_tokens = [
+                    w for w in re.findall(r"\b[a-zA-Z0-9]+\b", s.lower())
+                    if w not in self.STOPWORDS and len(w) >= 2
+                ]
+                s_stems = {self._stem(w) for w in s_tokens}
+                overlap = q_stems.intersection(s_stems)
+                score = len(overlap) / len(q_stems)
+                if score > best_score:
+                    best_score = score
+                    best_sent = s
+                    best_chunk_id = cid
+
+        # If highest sentence overlap is too low, abstain
+        if best_score < 0.25 or not best_sent:
+            return "I don't know based on the provided documents."
+
+        # Clean leading numbering and all-caps section titles (e.g. "2. ANNUAL LEAVE Eligible full-time...")
+        clean_sent = re.sub(r"^(?:[0-9]+\.|\*+|-)\s*", "", best_sent).strip()
+        clean_sent = re.sub(r"^[A-Z\s]{4,}\s+(?=[A-Z][a-z])", "", clean_sent).strip()
+
+        return f"{clean_sent} [Chunk {best_chunk_id}]"
 
 
 # ==============================================================================

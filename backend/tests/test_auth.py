@@ -1,11 +1,15 @@
-"""Tests for authentication, JWT lifecycle, password hashing and role-based access control."""
-
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+import uuid
+import jwt
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.config import get_settings
 from app.core import security
 from app.models.user import User
+
+settings = get_settings()
 
 
 def test_password_hashing_and_verification():
@@ -113,3 +117,152 @@ async def test_admin_role_authorization(
     )
     assert emp_resp.status_code == 403
     assert "Forbidden" in emp_resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_expired_jwt_rejected(async_client: AsyncClient, employee_user: User):
+    """Expired JWTs must be rejected with 401 Unauthorized."""
+    token = security.create_access_token(
+        subject=str(employee_user.id),
+        role=employee_user.role,
+        expires_delta=timedelta(seconds=-10),
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 401
+    assert "Invalid or expired token" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_incorrectly_signed_jwt_rejected(async_client: AsyncClient, employee_user: User):
+    """Tokens signed with a different/unauthorized secret key must be rejected with 401 Unauthorized."""
+    now = datetime.now(timezone.utc)
+    tampered_token = jwt.encode(
+        {"sub": str(employee_user.id), "role": employee_user.role, "exp": now + timedelta(hours=1)},
+        "wrong-secret-key-that-does-not-match-configured-secret",
+        algorithm="HS256",
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {tampered_token}"},
+    )
+    assert resp.status_code == 401
+    assert "Invalid or expired token" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_jwt_missing_subject_rejected(async_client: AsyncClient):
+    """Tokens missing the subject ('sub') claim must be rejected with 401 Unauthorized."""
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {"role": "employee", "exp": now + timedelta(hours=1)},
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 401
+    assert "missing subject claim" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_jwt_malformed_subject_uuid_rejected(async_client: AsyncClient):
+    """Tokens with malformed non-UUID subject claims must be rejected with 401 Unauthorized."""
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {"sub": "not-a-valid-uuid", "role": "employee", "exp": now + timedelta(hours=1)},
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 401
+    assert "Invalid or expired token" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_jwt_integer_subject_rejected(async_client: AsyncClient):
+    """Tokens with non-string integer subject claims must be rejected with 401 Unauthorized."""
+    now = datetime.now(timezone.utc)
+    token = jwt.encode(
+        {"sub": 12345, "role": "employee", "exp": now + timedelta(hours=1)},
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 401
+    assert "Invalid or expired token" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_jwt_nonexistent_user_rejected(async_client: AsyncClient):
+    """Tokens with a valid UUID that does not exist in the database must be rejected with 401."""
+    random_id = str(uuid.uuid4())
+    token = security.create_access_token(
+        subject=random_id,
+        role="employee",
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 401
+    assert "User associated with token not found" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_inactive_user_token_rejected(
+    async_client: AsyncClient,
+    db_session: AsyncSession,
+):
+    """Inactive accounts with valid JWTs must be denied with 403 Forbidden."""
+    inactive_user = User(
+        email="inactive@example.com",
+        hashed_password=security.hash_password("InactivePass123!"),
+        full_name="Inactive User",
+        role="employee",
+        is_active=False,
+    )
+    db_session.add(inactive_user)
+    await db_session.commit()
+    await db_session.refresh(inactive_user)
+
+    token = security.create_access_token(
+        subject=str(inactive_user.id),
+        role=inactive_user.role,
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/me",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 403
+    assert "User account is inactive" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_role_tampering_in_jwt_claims_blocked_by_database_role(
+    async_client: AsyncClient,
+    employee_user: User,
+):
+    """Forging role='admin' in a valid JWT payload for an employee user is blocked because
+    authorization checks the database record's role, not client token claims.
+    """
+    forged_token = security.create_access_token(
+        subject=str(employee_user.id),
+        role="admin",  # Tampered claim
+    )
+    resp = await async_client.get(
+        "/api/v1/auth/admin-only",
+        headers={"Authorization": f"Bearer {forged_token}"},
+    )
+    assert resp.status_code == 403
+    assert "Forbidden" in resp.json()["detail"]
